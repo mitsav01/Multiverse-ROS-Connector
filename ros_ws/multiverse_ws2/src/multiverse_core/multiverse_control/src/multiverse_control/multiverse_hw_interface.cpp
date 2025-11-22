@@ -1,15 +1,12 @@
 // Copyright (c) 2024, Giang Hoang Nguyen - Institute for Artificial Intelligence, University Bremen
-
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
 // to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
-
 // The above copyright notice and this permission notice shall be included in all
 // copies or substantial portions of the Software.
-
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -35,7 +32,6 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn Multiv
     meta_data["mass_unit"] = info_.hardware_parameters["mass_unit"];
     meta_data["time_unit"] = info_.hardware_parameters["time_unit"];
     meta_data["handedness"] = info_.hardware_parameters["handedness"];
-
     host = info_.hardware_parameters["host"];
     server_port = info_.hardware_parameters["server_port"];
     client_port = info_.hardware_parameters["client_port"];
@@ -48,11 +44,12 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn Multiv
         return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
     }
 
+    // First pass: collect all joints and identify mimic joints
     for (const hardware_interface::ComponentInfo &joint : info_.joints)
     {
         receive_objects[joint.name] = {};
-
         auto joint_type = urdf_model.getJoint(joint.name)->type;
+        
         if (joint_type == urdf::Joint::PRISMATIC || joint_type == urdf::Joint::REVOLUTE || joint_type == urdf::Joint::CONTINUOUS)
         {
             if (joint_type == urdf::Joint::PRISMATIC)
@@ -63,16 +60,52 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn Multiv
             {
                 receive_objects[joint.name] = {"joint_angular_position", "joint_angular_velocity"};
             }
-
             joint_names.push_back(joint.name);
             joint_states[joint.name] = (double *)calloc(2, sizeof(double));
             joint_commands[joint.name] = (double *)calloc(3, sizeof(double));
-
             init_joint_positions[joint.name] = 0.0;
         }
         else
         {
             RCLCPP_WARN(rclcpp::get_logger("multiverse_hw_interface"), "Joint %s is not prismatic, revolute or continuous, will be ignored", joint.name.c_str());
+        }
+
+        // Check for mimic joint parameters
+        if (joint.parameters.find("mimic") != joint.parameters.end())
+        {
+            MimicJoint mimic_joint;
+            mimic_joint.joint_name = joint.name;
+            mimic_joint.mimicked_joint = joint.parameters.at("mimic");
+            
+            // Parse multiplier with default value 1.0
+            if (joint.parameters.find("multiplier") != joint.parameters.end())
+            {
+                mimic_joint.multiplier = std::stod(joint.parameters.at("multiplier"));
+            }
+            else
+            {
+                mimic_joint.multiplier = 1.0;
+                RCLCPP_INFO(rclcpp::get_logger("multiverse_hw_interface"), 
+                           "Mimic joint %s: multiplier not specified, using default 1.0", joint.name.c_str());
+            }
+            
+            // Parse offset with default value 0.0
+            if (joint.parameters.find("offset") != joint.parameters.end())
+            {
+                mimic_joint.offset = std::stod(joint.parameters.at("offset"));
+            }
+            else
+            {
+                mimic_joint.offset = 0.0;
+                RCLCPP_INFO(rclcpp::get_logger("multiverse_hw_interface"), 
+                           "Mimic joint %s: offset not specified, using default 0.0", joint.name.c_str());
+            }
+            
+            mimic_joints_.push_back(mimic_joint);
+            RCLCPP_INFO(rclcpp::get_logger("multiverse_hw_interface"), 
+                       "Registered mimic joint: %s mimics %s (multiplier: %f, offset: %f)",
+                       mimic_joint.joint_name.c_str(), mimic_joint.mimicked_joint.c_str(),
+                       mimic_joint.multiplier, mimic_joint.offset);
         }
 
         for (const hardware_interface::InterfaceInfo &state_interface : joint.state_interfaces)
@@ -97,7 +130,6 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn Multiv
         {
             continue;
         }
-
         std::string actuator_name = joint.parameters.at("actuator");
         actuators[actuator_name] = joint.name;
         send_objects[actuator_name] = {};
@@ -145,14 +177,40 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn Multiv
         }
     }
 
+    // Validate mimic joints
+    for (const auto& mimic_joint : mimic_joints_)
+    {
+        if (joint_states.find(mimic_joint.mimicked_joint) == joint_states.end())
+        {
+            RCLCPP_ERROR(rclcpp::get_logger("multiverse_hw_interface"),
+                        "Mimic joint %s references non-existent joint %s",
+                        mimic_joint.joint_name.c_str(), mimic_joint.mimicked_joint.c_str());
+            return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
+        }
+        
+        // Remove mimic joints from send_objects since they shouldn't receive direct commands
+        for (auto it = actuators.begin(); it != actuators.end(); )
+        {
+            if (it->second == mimic_joint.joint_name)
+            {
+                RCLCPP_INFO(rclcpp::get_logger("multiverse_hw_interface"),
+                           "Removing actuator mapping for mimic joint %s", mimic_joint.joint_name.c_str());
+                send_objects.erase(it->first);
+                it = actuators.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
     connect();
-
     *world_time = 0.0;
-
     sim_start_time = get_time_now();
-
     commnunicate_thread = std::thread(
-        [this]() {
+        [this]()
+        {
             while (rclcpp::ok())
             {
                 communicate();
@@ -166,39 +224,49 @@ rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn Multiv
 std::vector<hardware_interface::StateInterface> MultiverseHWInterface::export_state_interfaces()
 {
     std::vector<hardware_interface::StateInterface> state_interfaces;
-
     for (const std::string &joint_name : joint_interfaces["position"])
     {
         state_interfaces.emplace_back(joint_name, "position", &joint_states[joint_name][0]);
     }
-
     for (const std::string &joint_name : joint_interfaces["velocity"])
     {
         state_interfaces.emplace_back(joint_name, "velocity", &joint_states[joint_name][1]);
     }
-
     return state_interfaces;
 }
 
 std::vector<hardware_interface::CommandInterface> MultiverseHWInterface::export_command_interfaces()
 {
     std::vector<hardware_interface::CommandInterface> command_interfaces;
-
+    
+    // Don't export command interfaces for mimic joints
+    std::vector<std::string> mimic_joint_names;
+    for (const auto& mimic_joint : mimic_joints_)
+    {
+        mimic_joint_names.push_back(mimic_joint.joint_name);
+    }
+    
     for (const std::string &joint_name : actuator_interfaces["position"])
     {
-        command_interfaces.emplace_back(joint_name, "position", &joint_commands[joint_name][0]);
+        if (std::find(mimic_joint_names.begin(), mimic_joint_names.end(), joint_name) == mimic_joint_names.end())
+        {
+            command_interfaces.emplace_back(joint_name, "position", &joint_commands[joint_name][0]);
+        }
     }
-
     for (const std::string &joint_name : actuator_interfaces["velocity"])
     {
-        command_interfaces.emplace_back(joint_name, "velocity", &joint_commands[joint_name][1]);
+        if (std::find(mimic_joint_names.begin(), mimic_joint_names.end(), joint_name) == mimic_joint_names.end())
+        {
+            command_interfaces.emplace_back(joint_name, "velocity", &joint_commands[joint_name][1]);
+        }
     }
-
     for (const std::string &joint_name : actuator_interfaces["effort"])
     {
-        command_interfaces.emplace_back(joint_name, "effort", &joint_commands[joint_name][2]);
+        if (std::find(mimic_joint_names.begin(), mimic_joint_names.end(), joint_name) == mimic_joint_names.end())
+        {
+            command_interfaces.emplace_back(joint_name, "effort", &joint_commands[joint_name][2]);
+        }
     }
-
     return command_interfaces;
 }
 
@@ -335,6 +403,38 @@ void MultiverseHWInterface::bind_receive_data()
     {
         *receive_data_vec[i] = receive_buffer.buffer_double.data[i];
     }
+    
+    // Update mimic joints after receiving data
+    update_mimic_joints();
+}
+
+void MultiverseHWInterface::update_mimic_joints()
+{
+    for (const auto& mimic_joint : mimic_joints_)
+    {
+        const std::string& mimic_name = mimic_joint.joint_name;
+        const std::string& mimicked_name = mimic_joint.mimicked_joint;
+        
+        if (joint_states.find(mimic_name) != joint_states.end() && 
+            joint_states.find(mimicked_name) != joint_states.end())
+        {
+            // Update position: offset + multiplier * mimicked_position
+            joint_states[mimic_name][0] = mimic_joint.offset + mimic_joint.multiplier * joint_states[mimicked_name][0];
+            
+            // Update velocity: multiplier * mimicked_velocity
+            joint_states[mimic_name][1] = mimic_joint.multiplier * joint_states[mimicked_name][1];
+            
+            RCLCPP_DEBUG(rclcpp::get_logger("multiverse_hw_interface"),
+                        "Mimic joint %s: position=%f, velocity=%f (from %s)",
+                        mimic_name.c_str(), joint_states[mimic_name][0], joint_states[mimic_name][1],
+                        mimicked_name.c_str());
+        }
+        else
+        {
+            RCLCPP_WARN(rclcpp::get_logger("multiverse_hw_interface"),
+                       "Cannot update mimic joint %s: required joints not found", mimic_name.c_str());
+        }
+    }
 }
 
 void MultiverseHWInterface::clean_up()
@@ -355,5 +455,4 @@ void MultiverseHWInterface::reset()
 }
 
 #include "pluginlib/class_list_macros.hpp"
-
 PLUGINLIB_EXPORT_CLASS(MultiverseHWInterface, hardware_interface::SystemInterface)

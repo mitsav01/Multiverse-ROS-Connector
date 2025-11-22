@@ -35,6 +35,14 @@
 #include "hardware_interface/types/hardware_interface_return_values.hpp"
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 
+struct MimicJoint
+{
+    std::string joint_name;
+    std::string mimicked_joint;
+    double multiplier = 1.0;
+    double offset = 0.0;
+};
+
 class MultiverseHWInterface : public MultiverseClientJson, public hardware_interface::SystemInterface
 {
 public:
@@ -80,6 +88,8 @@ private:
 
     void reset() override;
 
+    void update_mimic_joints();
+
 private:
     std::map<std::string, std::string> meta_data;
 
@@ -106,6 +116,8 @@ private:
     std::map<std::string, double *> joint_states;
 
     std::map<std::string, double *> joint_commands;
+
+    std::vector<MimicJoint> mimic_joints_;
 
     double sim_start_time;
 
